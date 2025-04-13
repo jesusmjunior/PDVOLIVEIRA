@@ -2,27 +2,12 @@ import streamlit as st
 import pandas as pd
 import hashlib
 from datetime import datetime
-import cv2
-import numpy as np
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
-from pyzbar.pyzbar import decode
-import av
+import io
+from PIL import Image
+import base64
 
 # Configuração inicial
 st.set_page_config(page_title="ORION PDV", layout="wide", initial_sidebar_state="collapsed")
-
-# Instalação automática dos pacotes necessários (comentar após primeira execução)
-import subprocess
-import sys
-
-try:
-    import streamlit_webrtc
-    import pyzbar
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", 
-                         "streamlit-webrtc", "pyzbar", "opencv-python-headless"])
-    st.info('Pacotes instalados. Por favor, reinicie a aplicação.')
-    st.stop()
 
 # URLs dos dados externos
 URL_GRUPO = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS0r3XE4DpzlYJjZwjc2c_pW_K3euooN9caPedtSq-nH_aEPnvx1jrcd9t0Yhg8fqXfR3j5jM2OyUQQ/pub?gid=528868130&single=true&output=csv"
@@ -32,7 +17,7 @@ URL_PRODUTO = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS0r3XE4DpzlYJjZw
 URL_PGTO = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS0r3XE4DpzlYJjZwjc2c_pW_K3euooN9caPedtSq-nH_aEPnvx1jrcd9t0Yhg8fqXfR3j5jM2OyUQQ/pub?gid=1061064660&single=true&output=csv"
 URL_VENDA = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS0r3XE4DpzlYJjZwjc2c_pW_K3euooN9caPedtSq-nH_aEPnvx1jrcd9t0Yhg8fqXfR3j5jM2OyUQQ/pub?gid=1817416820&single=true&output=csv"
 
-# Simulação de banco de dados de produtos com código de barras e fotos
+# Banco de dados simulado de produtos
 if 'produtos_db' not in st.session_state:
     st.session_state.produtos_db = {
         '7891000315507': {
@@ -64,53 +49,9 @@ if 'produtos_db' not in st.session_state:
         }
     }
 
-# Variável para armazenar o último código de barras detectado
+# Variável para armazenar o último código de barras
 if 'ultimo_codigo' not in st.session_state:
     st.session_state.ultimo_codigo = None
-
-# Classe do transformador de vídeo para detectar códigos de barras
-class BarcodeVideoTransformer(VideoTransformerBase):
-    def __init__(self):
-        self.last_code = None
-        self.codes_detected = set()  # Conjunto para evitar duplicatas
-        self.last_detection_time = 0
-        
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        
-        # Decodificar códigos de barras na imagem
-        barcodes = decode(img)
-        
-        # Processar cada código de barras encontrado
-        current_time = datetime.now().timestamp()
-        for barcode in barcodes:
-            # Extrair dados e tipo do código de barras
-            barcode_data = barcode.data.decode('utf-8')
-            barcode_type = barcode.type
-            
-            # Desenhar retângulo em volta do código de barras
-            pts = barcode.polygon
-            if pts:
-                pts = np.array(pts, np.int32)
-                pts = pts.reshape((-1, 1, 2))
-                cv2.polylines(img, [pts], True, (0, 255, 0), 2)
-            
-            # Desenhar dados do código de barras na imagem
-            x, y, w, h = barcode.rect
-            cv2.putText(img, f"{barcode_data} ({barcode_type})", 
-                      (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # Verificar se é um novo código ou se passaram pelo menos 3 segundos
-            if (barcode_data not in self.codes_detected or 
-                current_time - self.last_detection_time > 3):
-                self.last_code = barcode_data
-                self.codes_detected.add(barcode_data)
-                self.last_detection_time = current_time
-                
-                # Atualizar a variável de sessão
-                st.session_state.ultimo_codigo = barcode_data
-        
-        return img
 
 # Função de autenticação
 def autenticar_usuario():
@@ -138,41 +79,96 @@ def autenticar_usuario():
         else:
             st.error("Usuário não encontrado.")
 
-# Função para scanner de código de barras nativo
-def leitor_codigo_barras_nativo():
+# Função para scanner de código de barras simplificado
+def leitor_codigo_barras():
     st.subheader("📷 Scanner de Código de Barras")
     
-    # Coluna para o scanner e para código manual
+    # Componente JavaScript para leitura de código de barras
+    barcode_scanner_html = """
+    <div style="padding: 20px; border: 1px solid #ccc; border-radius: 5px; margin-bottom: 20px;">
+        <h4 style="color: #0066cc;">Scanner via câmera do dispositivo</h4>
+        <p>Para escanear um código de barras:</p>
+        <ol>
+            <li>Use um aplicativo de scanner no seu celular</li>
+            <li>Ou tire uma foto do código de barras</li>
+            <li>Digite o código detectado no campo abaixo</li>
+        </ol>
+        <p style="color: #666; font-style: italic;">Dica: Em dispositivos Android, você pode usar o Google Lens ou o aplicativo de câmera para ler códigos de barras.</p>
+    </div>
+    """
+    st.markdown(barcode_scanner_html, unsafe_allow_html=True)
+    
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        # WebRTC para acessar a câmera
-        ctx = webrtc_streamer(
-            key="barcode-scanner",
-            video_transformer_factory=BarcodeVideoTransformer,
-            media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
-            async_processing=True,
-        )
+        # Capturar foto para processamento (opcional)
+        uploaded_file = st.file_uploader("📸 Upload da foto do código de barras (opcional)", 
+                                       type=["jpg", "png", "jpeg"])
         
-        # Exibe o último código detectado
-        if st.session_state.ultimo_codigo:
-            st.success(f"Código detectado: {st.session_state.ultimo_codigo}")
-            
-            # Botão para limpar
-            if st.button("Limpar código"):
-                st.session_state.ultimo_codigo = None
-                st.rerun()
+        # Manual input
+        codigo_barras = st.text_input("Digite o código de barras:", 
+                                    placeholder="Ex: 7891000315507")
     
     with col2:
-        # Entrada manual do código de barras
-        manual_code = st.text_input("Digite manualmente:", 
-                                  placeholder="Ex: 7891000315507")
+        if uploaded_file is not None:
+            try:
+                # Exibir a imagem carregada
+                image = Image.open(uploaded_file)
+                st.image(image, caption="Imagem carregada", width=150)
+                
+                # Aqui você poderia adicionar um processador de imagem 
+                # para extrair o código de barras se tiver as bibliotecas adequadas
+                st.info("Processamento automático de imagem não disponível. Digite o código manualmente.")
+            except Exception as e:
+                st.error(f"Erro ao processar imagem: {e}")
+    
+    # Botão para usar o código digitado
+    if st.button("Usar Código", type="primary") and codigo_barras:
+        st.session_state.ultimo_codigo = codigo_barras
+        st.success(f"Código registrado: {codigo_barras}")
         
-        if st.button("Usar código manual"):
-            st.session_state.ultimo_codigo = manual_code
-            st.rerun()
+        # Verificar se o código existe no banco de dados
+        if codigo_barras in st.session_state.produtos_db:
+            produto = st.session_state.produtos_db[codigo_barras]
+            st.success(f"Produto encontrado: {produto['nome']}")
+            
+            # Exibir informações do produto
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                if produto['foto']:
+                    st.image(produto['foto'], width=150)
+            with col2:
+                st.subheader(produto['nome'])
+                st.write(f"**Preço:** R$ {produto['preco']:.2f}")
+                st.write(f"**Estoque:** {produto['estoque']} unidades")
+        else:
+            st.warning(f"Código {codigo_barras} não encontrado no cadastro.")
     
     return st.session_state.ultimo_codigo
+
+# Função para integração alternativa com aplicativos de scanner
+def mostrar_instrucoes_scanner():
+    st.markdown("""
+    ### 📱 Integração com aplicativos de scanner
+    
+    Para escanear códigos de barras, você pode usar:
+    
+    1. **Google Lens** - Aponte para o código e copie o número
+    2. **Aplicativo Câmera** - Muitos celulares já detectam códigos automaticamente
+    3. **Qualquer app de scanner de QR/códigos de barras**
+    
+    Depois de obter o código, digite-o manualmente no campo acima.
+    """)
+    
+    # Adicionando QR Code para abrir esta aplicação no celular
+    # (substituir pelo seu URL real quando deployed)
+    app_url = "https://pdvoliveira.streamlit.app" 
+    st.markdown(f"""
+    <div style="text-align: center; margin: 20px 0;">
+        <p>Escaneie este QR Code para abrir o aplicativo no seu celular:</p>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={app_url}" width="150">
+    </div>
+    """, unsafe_allow_html=True)
 
 # Função de cadastro de produto com suporte a código de barras e foto
 def render_cadastro_produto():
@@ -240,29 +236,30 @@ def render_cadastro_produto():
     
     with tab2:
         # Scanner de código de barras fora do formulário
-        codigo_scaneado = leitor_codigo_barras_nativo()
+        codigo_scaneado = leitor_codigo_barras()
         
-        if codigo_scaneado:
-            if codigo_scaneado in st.session_state.produtos_db:
-                produto = st.session_state.produtos_db[codigo_scaneado]
-                st.success(f"Produto encontrado: {produto['nome']}")
-                
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    if produto['foto']:
-                        st.image(produto['foto'], width=200)
-                    else:
-                        st.info("Sem imagem disponível")
-                
-                with col2:
-                    st.subheader(produto['nome'])
-                    st.write(f"**Código de Barras:** {produto['codigo_barras']}")
-                    st.write(f"**Grupo:** {produto['grupo']}")
-                    st.write(f"**Marca:** {produto['marca']}")
-                    st.write(f"**Preço:** R$ {produto['preco']:.2f}")
-                    st.write(f"**Estoque:** {produto['estoque']} unidades")
-            else:
-                st.warning(f"Código de barras {codigo_scaneado} não encontrado. Cadastre o produto.")
+        # Instruções para uso com aplicativos externos
+        with st.expander("Como escanear códigos com seu celular", expanded=False):
+            mostrar_instrucoes_scanner()
+            
+        # Exibir todos os produtos cadastrados
+        st.subheader("Produtos Cadastrados")
+        
+        # Criar dataframe para visualização
+        produtos_list = []
+        for codigo, produto in st.session_state.produtos_db.items():
+            produtos_list.append({
+                "Código": codigo,
+                "Produto": produto['nome'],
+                "Preço": f"R$ {produto['preco']:.2f}",
+                "Estoque": produto['estoque']
+            })
+        
+        if produtos_list:
+            produtos_df = pd.DataFrame(produtos_list)
+            st.dataframe(produtos_df, use_container_width=True)
+        else:
+            st.info("Nenhum produto cadastrado.")
 
 # Função de cadastro de cliente
 def render_cadastro_cliente():
@@ -311,14 +308,35 @@ def render_registro_venda():
     # Área de leitura de código de barras
     st.subheader("Adicionar Produto por Código de Barras")
     
-    # Adicionar scanner nativo
-    codigo_scaneado = leitor_codigo_barras_nativo()
-    
     col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Input manual
+        codigo_manual = st.text_input("Digite o código de barras:", 
+                                     placeholder="Ex: 7891000315507")
+        
+        # Upload de imagem
+        uploaded_file = st.file_uploader("📸 Upload da foto do código de barras (opcional)", 
+                                       type=["jpg", "png", "jpeg"])
+        
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file)
+            st.image(image, caption="Imagem carregada", width=150)
+            st.info("Digite manualmente o código visualizado na imagem.")
+            
+        if st.button("✅ Usar Código", type="primary") and codigo_manual:
+            st.session_state.ultimo_codigo = codigo_manual
+            st.success(f"Código registrado: {codigo_manual}")
+    
     with col2:
         qtd = st.number_input("Quantidade", min_value=1, value=1, step=1)
     
+    # Link para instruções de scanner
+    with st.expander("Como escanear códigos com seu celular", expanded=False):
+        mostrar_instrucoes_scanner()
+    
     # Botão para adicionar produto ao carrinho
+    codigo_scaneado = st.session_state.ultimo_codigo
     if st.button("Adicionar ao Carrinho", type="primary") and codigo_scaneado:
         if codigo_scaneado in st.session_state.produtos_db:
             produto = st.session_state.produtos_db[codigo_scaneado]
